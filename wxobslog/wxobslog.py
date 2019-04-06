@@ -6,8 +6,11 @@ import requests
 from warnings import warn
 from dataclasses import dataclass
 from dateutil.tz import gettz
+import dateutil.parser
+from datetime import timedelta
 import enum
 import pkg_resources
+from threading import Timer
 
 from sqlalchemy import desc, create_engine, Table, Column, ForeignKey, Integer, String, Float, DateTime, Enum
 from sqlalchemy.orm import sessionmaker, relationship
@@ -31,7 +34,9 @@ class CloudCover(enum.Enum):
     Overcast            = 'OVC'
     VerticalVisibility  = 'VV'
 
-class NationalWeatherService:
+class WxObserverLogger(cmd.Cmd):
+    prompt = 'wxobslog> '
+
     API_BASE = 'https://api.weather.gov'
     USER_AGENT = f'{_project_name}/{_version} (wx@dou.gives)'
 
@@ -84,29 +89,45 @@ class NationalWeatherService:
         wind_speed = Column(Integer)
         def __eq__(self, other):
             return other != None \
-                and self.station == other.station \
+                and self.station_id == other.station_id \
                 and self.timestamp == other.timestamp
         def __ne__(self, other):
             return not self.__eq__(other)
         def __repr__(self):
             return f'<Observation({self.station} {self.timestamp})>'
 
+    class TrackedStations(Model):
+        __tablename__ = 'tracked_stations'
+        station_id = Column(String(4), ForeignKey('stations.id'), primary_key=True)
+        station = relationship('Station')
+        def __repr__(self):
+            return f'<TrackedStation({self.station})>'
+
     def __init__(self, db_connection_string):
+        super(WxObserverLogger, self).__init__()
         self._engine = create_engine(db_connection_string)
-        NationalWeatherService.Model.metadata.create_all(self._engine)
+        WxObserverLogger.Model.metadata.create_all(self._engine)
         self._session = sessionmaker(bind=self._engine)()
+        self._update_timer = Timer(30.0, self._update_thread)
+        self._update_timer.start()
+
+    def _update_thread(self):
+        [ self.log_latest_station_observation(t.station_id)
+            for t in self._session.query(
+                WxObserverLogger.TrackedStations).all() ]
+        self._update_timer.start()
 
     @staticmethod
     def _api_get(endpoint, *args):
         url = urljoin(
-            NationalWeatherService.API_BASE,
+            WxObserverLogger.API_BASE,
             endpoint) \
                 if not args \
                 else urljoin(
-                    NationalWeatherService.API_BASE,
+                    WxObserverLogger.API_BASE,
                     f'{endpoint}/' + '/'.join( str(arg) for arg in args ))
         headers = {
-            'User-Agent': NationalWeatherService.USER_AGENT,
+            'User-Agent': WxObserverLogger.USER_AGENT,
         }
         response = requests.get(url, headers=headers)
         if response.status_code != requests.codes.ok:
@@ -117,10 +138,10 @@ class NationalWeatherService:
         return geojson.loads(response.text)
 
     @staticmethod
-    def _parse_station(self, feature):
+    def _parse_station(feature):
         props = feature['properties']
         coords = feature['geometry']['coordinates']
-        return NationalWeatherService.Station(
+        return WxObserverLogger.Station(
             id=props['stationIdentifier'],
             name=props['name'],
             coordinates=f'POINT({coords[0]} {coords[1]})',
@@ -138,29 +159,36 @@ class NationalWeatherService:
 
     def _get_station_by_id(self, station_id):
         return self._session.query(
-            NationalWeatherService.Station).filter(
-                NationalWeatherService.Station.id == station_id).first()
+            WxObserverLogger.Station).filter(
+                WxObserverLogger.Station.id == station_id).first()
 
     def _get_last_logged_station_observation(self, station):
-        return self._session.query(
-            NationalWeatherService.Station.observations).order_by(
-                desc(NationalWeatherService.Observation.timestamp)).first()
+        # what the fuck
+        # SELECT stations.id = observations.station_id AS observations 
+        # FROM stations, observations
+        # obs = self._session.query(
+        #     WxObserverLogger.Station.observations).order_by(
+        #         desc(WxObserverLogger.Observation.timestamp)).first()
+        obs = self._session.query(WxObserverLogger.Observation).filter_by(
+            station_id=station.id).order_by(
+                desc(WxObserverLogger.Observation.timestamp)).first()
+        return obs
 
     def update_all_stations(self):
-        obj = NationalWeatherService._api_get('stations')
+        obj = WxObserverLogger._api_get('stations')
         if not obj:
             warn('Failed to update all stations, error requesting station list.')
             return
-        self._session.query(NationalWeatherService.Station).delete()
+        self._session.query(WxObserverLogger.Station).delete()
         new_stations = []
         for feature in obj['features']:
-            new_station = NationalWeatherService._parse_station(feature)
+            new_station = WxObserverLogger._parse_station(feature)
             old_station = self._get_station_by_id(new_station.id)
             if not old_station:
                 new_stations.append(
-                    NationalWeatherService._parse_station(feature))
+                    WxObserverLogger._parse_station(feature))
                 continue
-            NationalWeatherService._update_station_fields(
+            WxObserverLogger._update_station_fields(
                 old_station, new_station)
             self._session.flush()
         self._session.add_all(new_stations)
@@ -178,27 +206,43 @@ class NationalWeatherService:
         return station_id
 
     def update_station(self, station_id):
-        station_id = NationalWeatherService._normalize_station_id(station_id)
+        station_id = WxObserverLogger._normalize_station_id(station_id)
         if not station_id:
             warn('Failed to update station, invalid station id.')
             return
-        new_station = NationalWeatherService._api_get('stations', station_id)
-        if not station:
+        new_station = WxObserverLogger._api_get('stations', station_id)
+        if not new_station:
             warn('Failed to update station, error requesting station.')
             return
         old_station = self._get_station_by_id(new_station.id)
         if not old_station:
-            self._session.add(new_station)
+            self._session.add(
+                WxObserverLogger._parse_station(new_station))
             self._session.commit()
             return
         self._update_station_fields(old_station, new_station)
         self._session.commit()
 
+    def _find_or_update_station_by_id(self, station_id, warning_msg_verb):
+        station_id = WxObserverLogger._normalize_station_id(station_id)
+        if not station_id:
+            warn(f'Failed to {warning_msg_verb}, invalid station id.')
+            return
+        station = self._get_station_by_id(station_id)
+        if not station:
+            self.update_station(station_id)
+        station = self._get_station_by_id(station_id)
+        if not station:
+            warn(f'Failed to {warning_msg_verb}, station {station_id} not found.')
+            return
+        return station
+
     @staticmethod
     def _parse_observation(station, props):
-        return NationalWeatherService.Observation(
+        return WxObserverLogger.Observation(
+            station_id=station.id,
             station=station,
-            timestamp=props['timestamp'],
+            timestamp=dateutil.parser.isoparse(props['timestamp']).replace(tzinfo=None),
             barometric_pressure=props['barometricPressure']['value'],
             #cloud_cover=CloudCover(props['cloudLayers']['amount']),
             #cloud_base=props['cloudLayers']['base']['value'],
@@ -222,38 +266,71 @@ class NationalWeatherService:
             wind_speed=props['windSpeed']['value'])
 
     def log_latest_station_observation(self, station_id):
-        station_id = NationalWeatherService._normalize_station_id(station_id)
-        if not station_id:
-            warn('Failed to log last station observation, invalid station id.')
+        station = self._find_or_update_station_by_id(
+            station_id,
+            f'log latest station observation for {station_id}')
+        if not station:
             return
-        station = self._get_station_by_id(station_id)
-        if not station:
-            self.update_station(station_id)
-        station = self._get_station_by_id(station_id)
-        if not station:
-            warn(f'Failed to log last station observation, station {station_id} not found.')
-        obj = NationalWeatherService._api_get(
+        obj = WxObserverLogger._api_get(
             'stations', station_id, 'observations', 'latest')
         if not station:
             warn('Failed to log last station observation, error requesting requesting last observation.')
             return
         last_logged_obs = self._get_last_logged_station_observation(station)
-        obs = NationalWeatherService._parse_observation(station, obj['properties'])
+        obs = WxObserverLogger._parse_observation(station, obj['properties'])
         if obs == last_logged_obs:
+            del obs
+            self._session.rollback()
             return
         station.observations.append(obs)
         self._session.commit()
 
+    def _get_tracked_station_by_id(self, station_id):
+        return self._session.query(
+            WxObserverLogger.TrackedStations).filter_by(
+                station_id=station_id).one_or_none()
+
     def add_tracked_station(self, station_id):
-        station = self._get_station_by_id(station_id)
+        station = self._find_or_update_station_by_id(
+            station_id,
+            f'add tracked station {station_id}')
         if not station:
-            pass
-        assert False
-        
+            return
+        already_tracked = self._get_tracked_station_by_id(station_id)
+        if already_tracked:
+            return
+        tracked_station = WxObserverLogger.TrackedStations(
+            station_id=station_id,
+            station=station)
+        self._session.add(tracked_station)
+        self._session.commit()
+
+    def remove_tracked_station(self, station_id):
+        tracked_station = self._get_tracked_station_by_id(station_id)
+        if not tracked_station:
+            warn(f'Cannot remove tracked station {station_id}, because it is not currently being tracked.')
+            return
+        self._session.delete(tracked_station)
+        self._session.commit()
+
+    def do_track(self, station_id):
+        self.add_tracked_station(station_id)
+    def do_untrack(self, station_id):
+        self.remove_tracked_station(station_id)
+    def do_list(self, arg):
+        [ print(t.station_id)
+            for t in self._session.query(
+                WxObserverLogger.TrackedStations).all() ]
+    def do_update(self, arg):
+        self._update_thread()
+    def close(self):
+        self._update_timer.cancel()
+        self._session.close()
 
 def main():
-    nws = NationalWeatherService(os.environ['WXOBSLOG_DB_CONNECTION_STRING'])
-    nws.log_latest_station_observation('KORD')
+    wxobslogger= WxObserverLogger(
+        os.environ['WXOBSLOG_DB_CONNECTION_STRING'])
+    wxobslogger.cmdloop()
     return 0
 
 if __name__ == '__main__':
