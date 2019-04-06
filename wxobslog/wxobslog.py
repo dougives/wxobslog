@@ -103,20 +103,24 @@ class WxObserverLogger(cmd.Cmd):
         def __repr__(self):
             return f'<TrackedStation({self.station})>'
 
-    def __init__(self, db_connection_string):
+    def __init__(self, db_connection_string, update_interval=1800.00):
         super(WxObserverLogger, self).__init__()
         self._engine = create_engine(db_connection_string)
         WxObserverLogger.Model.metadata.create_all(self._engine)
         self._session = sessionmaker(bind=self._engine)()
-        self._stop_update_timer = self._update_thread(30.0)
+        self.update_interval = update_interval
+        self._stop_update_timer = self._update_thread()
 
-    def _update_thread(self, interval):
+    def _update(self):
+        [ self.log_latest_station_observation(t.station_id)
+            for t in self._session.query(
+                WxObserverLogger.TrackedStations).all() ]
+
+    def _update_thread(self):
         stopped = Event()
         def target():
-            while not stopped.wait(interval):
-                [ self.log_latest_station_observation(t.station_id)
-                    for t in self._session.query(
-                        WxObserverLogger.TrackedStations).all() ]
+            while not stopped.wait(self.update_interval):
+                self._update()
         Thread(target=target, daemon=True).start()
         return stopped.set
 
@@ -325,7 +329,9 @@ class WxObserverLogger(cmd.Cmd):
             for t in self._session.query(
                 WxObserverLogger.TrackedStations).all() ]
     def do_update(self, arg):
-        self._update_thread()
+        self._update()
+    def do_interval(self, arg)
+        self.update_interval = float(arg)
     def close(self):
         self._stop_update_timer()
         self._session.close()
