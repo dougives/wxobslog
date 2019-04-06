@@ -10,7 +10,7 @@ import dateutil.parser
 from datetime import timedelta
 import enum
 import pkg_resources
-from threading import Timer
+from threading import Event, Thread
 
 from sqlalchemy import desc, create_engine, Table, Column, ForeignKey, Integer, String, Float, DateTime, Enum
 from sqlalchemy.orm import sessionmaker, relationship
@@ -108,14 +108,17 @@ class WxObserverLogger(cmd.Cmd):
         self._engine = create_engine(db_connection_string)
         WxObserverLogger.Model.metadata.create_all(self._engine)
         self._session = sessionmaker(bind=self._engine)()
-        self._update_timer = Timer(30.0, self._update_thread)
-        self._update_timer.start()
+        self._stop_update_timer = self._update_thread(30.0)
 
-    def _update_thread(self):
-        [ self.log_latest_station_observation(t.station_id)
-            for t in self._session.query(
-                WxObserverLogger.TrackedStations).all() ]
-        self._update_timer.start()
+    def _update_thread(self, interval):
+        stopped = Event()
+        def target():
+            while not stopped.wait(interval):
+                [ self.log_latest_station_observation(t.station_id)
+                    for t in self._session.query(
+                        WxObserverLogger.TrackedStations).all() ]
+        Thread(target=target, daemon=True).start()
+        return stopped.set
 
     @staticmethod
     def _api_get(endpoint, *args):
@@ -324,7 +327,7 @@ class WxObserverLogger(cmd.Cmd):
     def do_update(self, arg):
         self._update_thread()
     def close(self):
-        self._update_timer.cancel()
+        self._stop_update_timer()
         self._session.close()
 
 def main():
