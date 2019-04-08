@@ -4,7 +4,6 @@ import geojson
 from urllib.parse import urljoin
 import requests
 from warnings import warn
-from dataclasses import dataclass
 from dateutil.tz import gettz
 import dateutil.parser
 from datetime import timedelta
@@ -63,9 +62,9 @@ class WxObserverLogger(cmd.Cmd):
 
     class Observation(Model):
         __tablename__ = 'observations'
-        station_id = Column(String(4), ForeignKey('stations.id'))
+        station_id = Column(String(4), ForeignKey('stations.id'), primary_key=True)
         station = relationship('Station', back_populates='observations')
-        timestamp = Column(DateTime, primary_key=True, timezone=True)
+        timestamp = Column(DateTime, primary_key=True)
         barometric_pressure = Column(Float)
         #cloud_cover = Column(Enum(CloudCover))
         #cloud_base = Column(Integer)
@@ -330,8 +329,10 @@ class WxObserverLogger(cmd.Cmd):
                 WxObserverLogger.TrackedStations).all() ]
     def do_update(self, arg):
         self._update()
-    def do_interval(self, arg)
+    def do_interval(self, arg):
         self.update_interval = float(arg)
+    def do_quit(self, arg):
+        raise KeyboardInterrupt
     def close(self):
         self._stop_update_timer()
         self._session.close()
@@ -339,7 +340,11 @@ class WxObserverLogger(cmd.Cmd):
 def main():
     wxobslogger= WxObserverLogger(
         os.environ['WXOBSLOG_DB_CONNECTION_STRING'])
-    wxobslogger.cmdloop()
+    try:
+        wxobslogger.cmdloop()
+    except KeyboardInterrupt:
+        wxobslogger.close()
+        print()
     return 0
 
 if __name__ == '__main__':
