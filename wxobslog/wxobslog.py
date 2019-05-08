@@ -169,12 +169,6 @@ class WxObserverLogger(cmd.Cmd):
                 WxObserverLogger.Station.id == station_id).first()
 
     def _get_last_logged_station_observation(self, station):
-        # what the fuck
-        # SELECT stations.id = observations.station_id AS observations 
-        # FROM stations, observations
-        # obs = self._session.query(
-        #     WxObserverLogger.Station.observations).order_by(
-        #         desc(WxObserverLogger.Observation.timestamp)).first()
         obs = self._session.query(WxObserverLogger.Observation).filter_by(
             station_id=station.id).order_by(
                 desc(WxObserverLogger.Observation.timestamp)).first()
